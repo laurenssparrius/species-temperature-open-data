@@ -1,8 +1,10 @@
+
 ##########################################################################################
 # STI calculation 
 # v 1.0 Gregory van der Top - original version
 # v 1.1 Laurens Sparrius - translated, csv support, clean up
 # v 1.2 Dion van der Hak - added percentile calculations, improved performance, improved readability
+# v 1.3 Dion van der Hak - rewrite: greatly improved performance by vectorization
 #
 # required files:
 # 1. GBIF csv: e.g. gbif_plants.CSV (fields: species, decimallongitude, decimallatitude)
@@ -11,186 +13,146 @@
 # 3. BioClim dataset: C:\\avgtemppergridcelleurope
 ##########################################################################################
 
-rm(list=ls())
-library(sp)
-library(data.table)
-library(rgdal)
-
-arrSti <- NULL
-
-occurrenceData <- read.csv("\\species-temperature-open-data\\Xanthoria (test input).csv")  
-data.table(occurrenceData)
-
-#register coordinate fields and coordinate reference system
-coordinates(occurrenceData) <- ~decimallongitude+decimallatitude
-proj4string(occurrenceData) <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0")
-
-#read shapefile 50x50km grid Europe
-#this shapefile has a Mercator projection as CRS
-rasterEurope <- readOGR(dsn="\\species-temperature-open-data\\Grid_ETRS89_LAEA5210_50KEEA15975I",layer="Grid_LAEA5210_50K_polygons")
-
-#transform occurrence point data to Mercator projection
-occurrences <- spTransform(occurrenceData,proj4string(rasterEurope))
-occurrencesCoords <- occurrences@data
-occurrencesAttrib <- occurrences@coords
-occurrences <- data.table(occurrencesCoords,occurrencesAttrib)
+STISfunction <- function(occurrenceData, raster, meanTemperature, coordinateSystem, nLoop = 100) {
+  
+  #stop function if wrong arguments are supplied
+  stopifnot(is.numeric(occurrenceData$decimallatitude))
+  stopifnot(is.numeric(occurrenceData$decimallongitude))
+  stopifnot(is.factor(occurrenceData$species))
+  stopifnot(is.factor(meanTemperature$CellCode))
+  stopifnot(is.numeric(meanTemperature$EofOrigin))
+  stopifnot(is.numeric(meanTemperature$NofOrigin))
+  stopifnot(is.numeric(meanTemperature[,4]))
+  stopifnot(is.character(coordinateSystem))
+  stopifnot(is.numeric(nLoop))
+  
+  #load packages
+  require(sp)
+  require(data.table)
+  require(rgdal)
+  
+  occurrenceData = data.table(occurrenceData)
+  
+  #register coordinate fields and coordinate reference system
+  coordinates(occurrenceData) <- ~decimallongitude+decimallatitude
+  proj4string(occurrenceData) <- CRS(coordinateSystem)
+  
+  #transform occurrence point data to Mercator projection
+  occurrences <- spTransform(occurrenceData, proj4string(raster))
+  occurrencesCoords <- occurrences@data
+  occurrencesAttrib <- occurrences@coords
+  occurrences <- data.table(occurrencesCoords, occurrencesAttrib)
+  
+  #round coordinates to match the 50 km grid
+  occurrences$xhokcor <- mfloor((occurrences$decimallongitude / 10000), 5)
+  occurrences$yhokcor <- mfloor((occurrences$decimallatitude / 10000), 5)
+  
+  #associate grid cells with cell codes of the ETRS grid map
+  occurrences$Cellcode <- paste0("50kmE", occurrences$xhokcor, "N", occurrences$yhokcor)
+  
+  #add generalized 250 km grid cells on top
+  occurrences$X250kmhok <- mfloor(occurrences$xhokcor, 25)
+  occurrences$y250kmhok <- mfloor(occurrences$yhokcor, 25)
+  occurrences$Cell250 <- paste0("250kmE", occurrences$X250kmhok, "N", occurrences$y250kmhok)
+  
+  #remove unused data
+  occurrences <- occurrences[, .(species, Cellcode, Cell250)]
+  meanTemperature <- data.table(meanTemperature[meanTemperature$CellCode %in% occurrences$Cellcode,])
+  
+  #50 - 250 cell associations
+  cellcodes <- occurrences[!duplicated(occurrences$Cellcode)]
+  cellcodes <- cellcodes[, .(Cellcode, Cell250)]
+  #temperature
+  cellcodes <- merge(cellcodes, meanTemperature[, c(1,4)], by.x = "Cellcode", by.y = "CellCode")
+  cellcodes$gemtempeuropa.1 <- cellcodes$gemtempeuropa.1 / 10
+  cellcodes$Cellcode <- as.character(cellcodes$Cellcode)
+  colnames(cellcodes) <- c("Cellcode", "Cell250", "temperature")
+  
+  arrBootstrapSTI <- NULL
+  
+  for(i in 1:nLoop) {
+    #random select 1 50km cell within each 250km cell
+    randomcells <- tapply(cellcodes$Cellcode, cellcodes$Cell250, sample, size = 1)
+    
+    ##############################
+    #Calculate STI for all species
+    ##############################
+    
+    #retrieve occurrences for each species
+    plant250 <- subset(occurrences, Cellcode %in% randomcells)
+    #add temperature per occurrence
+    STIdata <- merge(plant250, cellcodes[, c(1,3)], by = "Cellcode")
+    
+    #Calculate STI from array
+    STI <- tapply(STIdata$temperature, STIdata$species, FUN = mean, na.rm = T)
+    STI <- data.frame(STI)
+    STI <- data.table(species = row.names(STI), STI = STI$STI)
+    
+    stdv <- tapply(STIdata$temperature, STIdata$species, FUN = sd, na.rm = T)
+    stdv <- data.frame(stdv)
+    stdv <- data.table(species = row.names(stdv), stdv = stdv$stdv)
+    STIdatawithspecies <- merge(STI, stdv, by = "species")
+    
+    perc5 <- tapply(STIdata$temperature, STIdata$species, FUN = quantile, probs = 0.05, na.rm = T)
+    perc5 <- data.frame(perc5)
+    perc5 <- data.table(species = row.names(perc5), perc5 = perc5$perc5)
+    STIdatawithspecies <- merge(STIdatawithspecies, perc5, by = "species")
+    
+    perc25 <- tapply(STIdata$temperature, STIdata$species, FUN = quantile, probs = 0.25, na.rm = T)
+    perc25 <- data.frame(perc25)
+    perc25 <- data.table(species = row.names(perc25), perc25 = perc25$perc25)
+    STIdatawithspecies <- merge(STIdatawithspecies, perc25, by = "species")
+    
+    perc75 <- tapply(STIdata$temperature, STIdata$species, FUN = quantile, probs = 0.75, na.rm = T)
+    perc75 <- data.frame(perc75)
+    perc75 <- data.table(species = row.names(perc75), perc75 = perc75$perc75)
+    STIdatawithspecies <- merge(STIdatawithspecies, perc75, by = "species")
+    
+    perc95 <- tapply(STIdata$temperature, STIdata$species, FUN = quantile, probs = 0.95, na.rm = T)
+    perc95 <- data.frame(perc95)
+    perc95 <- data.table(species = row.names(perc95), perc95 = perc95$perc95)
+    STIdatawithspecies <- merge(STIdatawithspecies, perc95, by = "species")
+    
+    arrBootstrapSTI <- rbind(arrBootstrapSTI, STIdatawithspecies)
+  }
+  
+  #get the averages over the samples
+  arrFinalSTI <- tapply(arrBootstrapSTI$STI, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalSTI <- data.frame(arrFinalSTI)
+  arrFinalSTI <- data.table(species = row.names(arrFinalSTI), STI = arrFinalSTI$arrFinalSTI)
+  
+  arrFinalStDev <- tapply(arrBootstrapSTI$stdv, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalStDev <- data.frame(arrFinalStDev)
+  arrFinalStDev <- data.table(species = row.names(arrFinalStDev), SD = arrFinalStDev$arrFinalStDev)
+  STISxx <- merge(arrFinalSTI, arrFinalStDev, by = "species")
+  
+  arrFinalPerc5 <- tapply(arrBootstrapSTI$perc5, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalPerc5 <- data.frame(arrFinalPerc5)
+  arrFinalPerc5 <- data.table(species = row.names(arrFinalPerc5), perc5 = arrFinalPerc5$arrFinalPerc5)
+  STISxx <- merge(STISxx, arrFinalPerc5, by = "species")
+  
+  arrFinalPerc25 <- tapply(arrBootstrapSTI$perc25, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalPerc25 <- data.frame(arrFinalPerc25)
+  arrFinalPerc25 <- data.table(species = row.names(arrFinalPerc25), perc25 = arrFinalPerc25$arrFinalPerc25)
+  STISxx <- merge(STISxx, arrFinalPerc25, by = "species")
+  
+  arrFinalPerc75 <- tapply(arrBootstrapSTI$perc75, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalPerc75 <- data.frame(arrFinalPerc75)
+  arrFinalPerc75 <- data.table(species = row.names(arrFinalPerc75), perc75 = arrFinalPerc75$arrFinalPerc75)
+  STISxx <- merge(STISxx, arrFinalPerc75, by = "species")
+  
+  arrFinalPerc95 <- tapply(arrBootstrapSTI$perc95, arrBootstrapSTI$species, FUN = mean, na.rm = T)
+  arrFinalPerc95 <- data.frame(arrFinalPerc95)
+  arrFinalPerc95 <- data.table(species = row.names(arrFinalPerc95), perc95 = arrFinalPerc95$arrFinalPerc95)
+  STISxx <- merge(STISxx, arrFinalPerc95, by = "species")
+  
+  #compile dataset for export
+  colnames(STISxx)[4:7] <- c("5th_percentile", "25th_percentile", "75th_percentile", "95th_percentile")
+  
+  return(STISxx)
+}
 
 #function to round to the nearest base value
 mfloor <- function(x, base) {
   base * floor(x / base)
 }
-
-#round coordinates to match the 50 km grid
-occurrences$xhokcor <- mfloor((occurrences$decimallongitude / 10000), 5)
-occurrences$yhokcor <- mfloor((occurrences$decimallatitude / 10000), 5)
-
-#associate grid cells with cell codes of the ETRS grid map
-occurrences$"50kmE" <- "50kmE"
-occurrences$N <- "N"
-occurrences$Cellcode <- paste0(occurrences$`50kmE`, occurrences$xhokcor, occurrences$N, occurrences$yhokcor)
-
-#add generalized 250 km grid cells on top
-occurrences$X250kmhok <- mfloor(occurrences$xhokcor, 25)
-occurrences$y250kmhok <- mfloor(occurrences$yhokcor, 25)
-occurrences$"250kmE" <- "250kmE"
-occurrences$Cell250 <- paste0(occurrences$`250kmE`, occurrences$X250kmhok, occurrences$N, occurrences$y250kmhok)
-
-#open climate data
-meanTemperatureEurope <- readRDS("\\species-temperature-open-data\\avgtemppergridcelleurope")
-meanTemperatureEurope$CellCode <- as.character(meanTemperatureEurope$CellCode)
-meanTemperatureEurope <- meanTemperatureEurope[meanTemperatureEurope$CellCode %in% occurrences$Cellcode,] #remove unused temperature data to speed up calculations
-
-STISfunction <- function(x) {
-  
-  x$species <- as.character(x$species)
-
-  arrStiStd <- NULL
-
-  #random select 1 50km cell within each 250km cell
-  for(i in unique(x$Cell250)) {
-    gridcell250 <- x[x$Cell250 == i,]
-    randomgridcell <- sample(unique(gridcell250$Cellcode), 1)
-    plant250 <- subset(x, Cellcode %in% randomgridcell)
-    arrStiStd <- rbind(arrStiStd, plant250)
-   }
-  
-  plant250 <- arrStiStd
-  
-  ############################
-  #Calculate STI for a species
-  ############################
-
-  arrSti <- NULL
-  arrStiStd <- NULL
-  arrStiPerc5 <- NULL
-  arrStiPerc25 <- NULL
-  arrStiPerc75 <- NULL
-  arrStiPerc95 <- NULL
-
-  for(i in unique(plant250$species)) {
-
-    #retrieve occurrences for each species
-    sampleOccurrences <- plant250[species == i]
-
-    STIdata <- NULL
-
-    for(j in unique(sampleOccurrences$Cellcode)) {
-      tempx <- meanTemperatureEurope$gemtempeuropa.1[meanTemperatureEurope$CellCode == j]
-      STIdata <- rbind(STIdata, tempx)
-      STIdata2 <- STIdata / 10
-    }
-    
-    #Calculate STI from array
-    STI <- mean(STIdata2, na.rm = T)
-    stdv <- sd(STIdata2, na.rm = T)
-    perc5 <- quantile(STIdata2, 0.05, na.rm = T)
-    perc25 <- quantile(STIdata2, 0.25, na.rm = T)
-    perc75 <- quantile(STIdata2, 0.75, na.rm = T)
-    perc95 <- quantile(STIdata2, 0.95, na.rm = T)
-    
-    arrSti <- rbind(arrSti, STI)
-    arrStiStd <- rbind(arrStiStd, stdv)
-    arrStiPerc5 <- rbind(arrStiPerc5, perc5)
-    arrStiPerc25 <- rbind(arrStiPerc25, perc25)
-    arrStiPerc75 <- rbind(arrStiPerc75, perc75)
-    arrStiPerc95 <- rbind(arrStiPerc95, perc95)
-  }
-  
-  colnames(arrSti)[1] <- "STIspecies"
-  colnames(arrStiStd)[1] <- "STDEVspecies"
-  colnames(arrStiPerc5)[1] <- "perc5species"
-  colnames(arrStiPerc25)[1] <- "perc25species"
-  colnames(arrStiPerc75)[1] <- "perc75species"
-  colnames(arrStiPerc95)[1] <- "perc95species"
-  STIdata <- data.table(arrSti)
-  STI.STDEV <- data.table(arrStiStd)
-  STI.perc5 <- data.table(arrStiPerc5)
-  STI.perc25 <- data.table(arrStiPerc25)
-  STI.perc75 <- data.table(arrStiPerc75)
-  STI.perc95 <- data.table(arrStiPerc95)
-
-  speciesname <- unique(plant250$species)
-  STIdatawithspecies <- data.table(STIdata, speciesname, STI.STDEV, STI.perc5, STI.perc25, STI.perc75, STI.perc95)
-  
-  return(STIdatawithspecies)
-}
-
-arrBootstrapSti <- NULL
-nLoop <- 100
-time1 <- as.numeric(Sys.time())
-
-for(i in 1:nLoop) {
-  STIS <- STISfunction(x = occurrences)
-  arrBootstrapSti <- rbind(arrBootstrapSti, STIS)
-  if(i %% (nLoop/10) == 0) {
-    print(paste0("Progress: ", i / nLoop * 100, "%"))
-  }
-}
-
-time2 <- as.numeric(Sys.time())
-print(paste0("Finished in ", time2 - time1, " seconds!"))
-
-arrFinalSTI <- NULL
-arrFinalStDev <- NULL
-arrFinalPerc5 <- NULL
-arrFinalPerc25 <- NULL
-arrFinalPerc75 <- NULL
-arrFinalPerc95 <- NULL
-
-for(i in unique(arrBootstrapSti$speciesname)) {
-  uniqueSpecies <- arrBootstrapSti[arrBootstrapSti$speciesname == i,]
-  speciesname <- i
-  STImean <- mean(uniqueSpecies$STIspecies, na.rm = T)
-  STIsddev <- mean(uniqueSpecies$STDEVspecies, na.rm = T)
-  STIperc5 <- mean(uniqueSpecies$perc5species, na.rm = T)
-  STIperc25 <- mean(uniqueSpecies$perc25species, na.rm = T)
-  STIperc75 <- mean(uniqueSpecies$perc75species, na.rm = T)
-  STIperc95 <- mean(uniqueSpecies$perc95species, na.rm = T)
-  arrFinalSTI <- rbind(arrFinalSTI, STImean)
-  arrFinalStDev <- rbind(arrFinalStDev, STIsddev)
-  arrFinalPerc5 <- rbind(arrFinalPerc5, STIperc5)
-  arrFinalPerc25 <- rbind(arrFinalPerc25, STIperc25)
-  arrFinalPerc75 <- rbind(arrFinalPerc75, STIperc75)
-  arrFinalPerc95 <- rbind(arrFinalPerc95, STIperc95)
-}
-
-#compile dataset for export
-STISmean <- data.table(arrFinalSTI)
-STISstdev <- data.table(arrFinalStDev)
-STISperc5 <- data.table(arrFinalPerc5)
-STISperc25 <- data.table(arrFinalPerc25)
-STISperc75 <- data.table(arrFinalPerc75)
-STISperc95 <- data.table(arrFinalPerc95)
-colnames(STISmean)[1] <- "STIspecies"
-colnames(STISstdev)[1] <- "STIstdev"
-colnames(STISperc5)[1] <- "5th_percentile"
-colnames(STISperc25)[1] <- "25th_percentile"
-colnames(STISperc75)[1] <- "75th_percentile"
-colnames(STISperc95)[1] <- "95th_percentile"
-STISxx <- data.table(STISmean, STISstdev, STISperc5, STISperc25, STISperc75, STISperc95)
-STISxx$species <- unique(arrBootstrapSti$speciesname)
-colnames(STISxx)[1] <- "STI"
-colnames(STISxx)[2] <- "SD"
-
-write.csv(STISxx, file = "\\species-temperature-open-data\\SpeciesSTI.csv")
-##############################################
